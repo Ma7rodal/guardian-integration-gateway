@@ -100,7 +100,15 @@ After 30 seconds (`CB_RECOVERY_TIMEOUT_SECONDS`), the breaker transitions to `HA
 Inside the Docker container (zero local Python setup needed):
 
 ```bash
-docker compose exec guardian-gateway pytest -v
+docker-compose exec guardian-gateway pytest -v
+```
+
+### Running the Smoke & Stress Test Suite
+
+Validates input boundaries (`422`), ES/EN PII red-teaming & 9.5KB ReDoS check, 20 concurrent audit writes, 50-request Circuit Breaker burst, and zero-leak AES-256-GCM integrity on `audit_log.json`:
+
+```bash
+docker-compose exec guardian-gateway python scripts/smoke_stress_test.py
 ```
 
 Or locally with Python 3.10+:

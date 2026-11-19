@@ -20,6 +20,7 @@ RUN addgroup --system guardian \
 
 COPY --chown=guardian:guardian app/ ./app/
 COPY --chown=guardian:guardian tests/ ./tests/
+COPY --chown=guardian:guardian scripts/ ./scripts/
 COPY --chown=guardian:guardian pytest.ini ./pytest.ini
 
 USER guardian
