@@ -235,6 +235,44 @@ def stage_5_audit_integrity_check(
     )
 
 
+async def ensure_circuit_closed(client: httpx.AsyncClient) -> None:
+    """Ensure the Circuit Breaker is CLOSED before running stages.
+
+    If OPEN, waits for the remaining cooldown; if HALF_OPEN, sends a single
+    recovery probe to verify automatic HALF_OPEN -> CLOSED transition.
+    """
+    health = await client.get("/health")
+    assert health.status_code == 200, f"Gateway unhealthy: {health.status_code}"
+    cb = health.json()["circuitBreaker"]
+    state = cb["state"]
+
+    if state == "CLOSED":
+        return
+
+    if state == "OPEN":
+        wait_s = (cb.get("retryAfterSeconds") or 1.0) + 0.5
+        print(
+            f"[Pre-flight] Circuit is OPEN. Waiting {wait_s:.1f}s for cooldown "
+            f"to test automatic HALF_OPEN -> CLOSED recovery..."
+        )
+        await asyncio.sleep(wait_s)
+        state = "HALF_OPEN"
+
+    if state == "HALF_OPEN":
+        print("[Pre-flight] Circuit is HALF_OPEN. Sending single recovery probe...")
+        probe = await client.post(
+            "/secure-inquiry",
+            json={"userId": "preflight-probe", "message": "Recovery probe"},
+        )
+        assert probe.status_code == 200, (
+            f"Recovery probe failed: {probe.status_code} {probe.text}"
+        )
+        assert probe.json()["circuitState"] == "CLOSED", (
+            f"Expected CLOSED after probe, got {probe.json()['circuitState']}"
+        )
+        print("  PASS: Circuit automatically recovered HALF_OPEN -> CLOSED.")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Guardian Gateway Smoke & Stress Suite")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -249,14 +287,7 @@ async def main() -> None:
     print("=" * 72)
 
     async with httpx.AsyncClient(base_url=args.base_url, timeout=30.0) as client:
-        health = await client.get("/health")
-        assert health.status_code == 200, f"Gateway unhealthy: {health.status_code}"
-        if health.json()["circuitBreaker"]["state"] != "CLOSED":
-            print(
-                "  WARN: Circuit breaker is not CLOSED at start. "
-                "Restart the container or wait for cooldown before running."
-            )
-            sys.exit(1)
+        await ensure_circuit_closed(client)
 
         await stage_1_input_validation(client)
         secrets = await stage_2_pii_red_teaming(client)
