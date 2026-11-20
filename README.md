@@ -1,6 +1,6 @@
 # The Guardian Integration Gateway
 
-A secure AI middleware service built with **Python + FastAPI**, **Microsoft Presidio**, **AES-256-GCM** encrypted audit logging, and a **3-state Circuit Breaker**, packaged in Docker.
+A secure AI middleware service built with **Python + FastAPI**, **Microsoft Presidio**, **AES-256-GCM** encrypted O(1) JSONL audit logging, and a **3-state Circuit Breaker**, packaged in Docker.
 
 ---
 
@@ -9,14 +9,14 @@ A secure AI middleware service built with **Python + FastAPI**, **Microsoft Pres
 ```mermaid
 flowchart LR
     Client["Client / Swagger UI"] -->|"POST /secure-inquiry"| API["FastAPI Gateway"]
-    API --> Sanitizer["1. PII Sanitizer<br/>(Microsoft Presidio + Custom 9-digit SSN)"]
+    API --> Sanitizer["1. PII Sanitizer<br/>(Presidio via asyncio.to_thread)"]
     Sanitizer --> CB{"2. Circuit Breaker<br/>(CLOSED / OPEN / HALF_OPEN)"}
     CB -->|"OPEN (Instant <50ms)"| Fallback["503 'Service Busy' + Retry-After"]
-    CB -->|"CLOSED / HALF_OPEN"| MockAI["Mock AI Client<br/>(2s async delay)"]
-    MockAI -->|"Success (200)"| Audit["3. Audit Logger<br/>(AES-256-GCM + Atomic JSON)"]
+    CB -->|"CLOSED / HALF_OPEN"| MockAI["AI Provider (AIClient Protocol)<br/>MockAIClient (2s async delay)"]
+    MockAI -->|"Success (200)"| Audit["3. Audit Logger<br/>(AES-256-GCM + O(1) JSONL)"]
     MockAI -->|"Failure (502, count++)"| Audit
     Fallback --> Audit
-    Audit --> Store[("data/audit_log.json")]
+    Audit --> Store[("data/audit_log.jsonl")]
 ```
 
 ---
@@ -28,7 +28,7 @@ flowchart LR
 cp .env.example .env
 
 # 2. Build and start the gateway
-docker compose up --build -d
+docker-compose up --build -d
 
 # 3. Verify health & Circuit Breaker state
 curl -s http://localhost:8000/health | python3 -m json.tool
@@ -63,15 +63,15 @@ Expected response (`200 OK`, ~2000ms):
 }
 ```
 
-Inspect the persisted audit log inside the Docker volume:
+Inspect the persisted O(1) JSON Lines audit log inside the Docker volume:
 ```bash
-docker-compose exec guardian-gateway cat /app/data/audit_log.json
+docker-compose exec guardian-gateway cat /app/data/audit_log.jsonl
 ```
-You will see `originalMessageEncrypted` (AES-256-GCM Base64 ciphertext) alongside `redactedMessage` (plaintext).
+Each line is a self-contained JSON record with `originalMessageEncrypted` (AES-256-GCM Base64 ciphertext) alongside `redactedMessage` (plaintext).
 
 ### 2. Triggering the Circuit Breaker (3 Consecutive Failures → Instant `503 Service Busy`)
 
-Use the deterministic test header `X-Simulate-Failure: true` to simulate 3 consecutive upstream AI failures:
+In non-production environments (`ENVIRONMENT=development`), use the deterministic header `X-Simulate-Failure: true` to simulate 3 consecutive upstream AI failures (this header is automatically ignored when `ENVIRONMENT=production` to prevent DoS):
 
 ```bash
 for i in 1 2 3; do
@@ -105,7 +105,7 @@ docker-compose exec guardian-gateway pytest -v
 
 ### Running the Smoke & Stress Test Suite
 
-Validates input boundaries (`422`), ES/EN PII red-teaming & 9.5KB ReDoS check, 20 concurrent audit writes, 50-request Circuit Breaker burst, and zero-leak AES-256-GCM integrity on `audit_log.json`:
+Validates input boundaries (`422`), ES/EN PII red-teaming & 9.5KB ReDoS check, 20 concurrent audit writes, 50-request Circuit Breaker burst, automatic `OPEN` → `HALF_OPEN` → `CLOSED` recovery, and zero-leak AES-256-GCM integrity on `audit_log.jsonl`:
 
 ```bash
 docker-compose exec guardian-gateway python scripts/smoke_stress_test.py
@@ -125,27 +125,31 @@ pytest -v
 
 ## AI Orchestration & Security Engineering Decisions
 
-This project was built using a **Spec-Driven & Security-First** workflow with **Google Antigravity (Gemini)**:
+This project was built using a **Spec-Driven & Security-First** workflow with **Google Antigravity (Gemini)**, followed by an adversarial security audit:
 
-1. **Enterprise PII Detection with Custom Guardrails (`app/sanitizer.py`)**:
-   - Uses **Microsoft Presidio** (`presidio-analyzer` + `presidio-anonymizer`) rather than fragile ad-hoc regexes alone.
-   - **Audited Edge Case**: Presidio's default `US_SSN` recognizer requires English context words or delimiters and can miss raw 9-digit numeric sequences (especially in non-English text). We added `GuardianNineDigitSSNRecognizer` (`(?<!\d)\d{9}(?!\d)` and `\b\d{3}[-\s]\d{2}[-\s]\d{4}\b`) while relying on Presidio's Luhn-validated `CREDIT_CARD` recognizer (score `1.0`) so 16-digit card numbers are never partially split into 9-digit SSNs.
-   - **Cold-Start Mitigation**: `en_core_web_sm` is baked into the Docker image at build time and `PresidioSanitizer` is pre-warmed once during FastAPI's `lifespan` startup.
-2. **Authenticated Encryption at Rest (`app/crypto.py`)**:
-   - Uses **AES-256-GCM** (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`) with a fresh 96-bit random nonce per audit record, preventing ciphertext correlation and detecting tampering. Keys are loaded via `ENCRYPTION_KEY` environment variable.
-3. **Concurrency-Safe Atomic Audit Writes (`app/audit_log.py`)**:
-   - Guarded by `asyncio.Lock` and persisted via temporary file + `os.replace()` so concurrent requests cannot corrupt `data/audit_log.json`. Raw PII is never printed to application logs.
-4. **Resilient 3-State Circuit Breaker (`app/circuit_breaker.py`)**:
-   - Implements `CLOSED` → `OPEN` (after 3 consecutive failures) → `HALF_OPEN` (single probe after cooldown) with `asyncio.Lock`, returning HTTP `503` + `Retry-After` + `"answer": "Service Busy"` immediately without waiting for the 2-second AI delay.
-5. **Hardened Containerization (`Dockerfile`)**:
+1. **Enterprise PII Detection Off the Event Loop (`app/sanitizer.py`, `app/main.py`)**:
+   - Uses **Microsoft Presidio** (`presidio-analyzer` + `presidio-anonymizer`) with `en_core_web_sm` baked into the Docker image and pre-warmed at FastAPI `lifespan` startup.
+   - **Audited Edge Case**: Presidio's default `US_SSN` recognizer requires English context words or delimiters and can miss raw 9-digit numbers. We added `GuardianNineDigitSSNRecognizer` (`(?<!\d)\d{9}(?!\d)` and `\b\d{3}[-\s]\d{2}[-\s]\d{4}\b`) while relying on Presidio's Luhn-validated `CREDIT_CARD` recognizer (score `1.0`) so 16-digit cards are never split into 9-digit SSNs.
+   - **Non-blocking NLP**: CPU-bound `sanitizer.sanitize()` runs via `await asyncio.to_thread(...)` so long inputs never block uvicorn's async event loop.
+2. **Fail-Safe Production Configuration (`app/config.py`)**:
+   - Startup validation via Pydantic `@model_validator` **refuses to boot** if `ENVIRONMENT=production` uses the default demo `ENCRYPTION_KEY`.
+   - `X-Simulate-Failure` is strictly gated by `ENVIRONMENT != "production"` (`can_simulate_failures`), eliminating header-based DoS vectors in production.
+3. **Authenticated Encryption at Rest (`app/crypto.py`)**:
+   - Uses **AES-256-GCM** (`AESGCM`) with a fresh 96-bit random nonce per record, preventing ciphertext correlation and detecting tampering.
+4. **O(1) Append-Only Audit Log (`app/audit_log.py`)**:
+   - Uses **JSON Lines (`audit_log.jsonl`)** with `asyncio.Lock` + `os.fsync()` instead of O(n) full-file JSON array rewrites, scaling smoothly under sustained concurrency while never printing raw PII to application logs.
+5. **Resilient 3-State Circuit Breaker (`app/circuit_breaker.py`, `app/ai_client.py`)**:
+   - Decoupled via `AIClient` `Protocol` and configured with `expected_exceptions=(AIServiceError,)` so internal programming bugs never falsely trip the breaker.
+   - Guards `_opened_at` so late failures from concurrent in-flight calls cannot unfairly reset the cooldown timer once `OPEN`.
+6. **Hardened Containerization (`Dockerfile`)**:
    - Runs as a dedicated non-root user (`guardian`), includes a built-in `HEALTHCHECK`, and isolates secrets via `.env.example` / `.gitignore`.
 
 ---
 
 ## 2–3 Minute Video Demo Checklist
 
-1. **Start Stack**: Run `docker compose up --build -d` and `curl http://localhost:8000/health`.
-2. **Automated Tests**: Run `docker compose exec guardian-gateway pytest -v` to show all security, encryption, circuit breaker, and API tests passing.
-3. **Happy Path + PII Redaction**: Call `POST /secure-inquiry` (via `curl` or Swagger UI at `http://localhost:8000/docs`) with an email, credit card, and SSN; highlight the ~2s response, `<REDACTED: TYPE>` output, and `"Generated Answer"`.
-4. **Audit Log Verification**: Run `docker-compose exec guardian-gateway cat /app/data/audit_log.json` to show `originalMessageEncrypted` (unreadable ciphertext) vs. `redactedMessage` (plaintext).
-5. **Circuit Breaker Twist**: Send 3 requests with `X-Simulate-Failure: true`, check `/health` (`"state": "OPEN"`), then send a 4th normal request showing instant `503` `"Service Busy"` in `<50ms` (no 2-second wait).
+1. **Start Stack**: Run `docker-compose up --build -d` and `curl http://localhost:8000/health`.
+2. **Happy Path + PII Redaction**: Call `POST /secure-inquiry` (via Swagger UI at `http://localhost:8000/docs` or `curl`) with an email, credit card, and SSN; highlight the ~2s response, `<REDACTED: TYPE>` output, and `"Generated Answer"`.
+3. **Audit Log Verification**: Run `docker-compose exec guardian-gateway cat /app/data/audit_log.jsonl` to show `originalMessageEncrypted` (unreadable ciphertext) vs. `redactedMessage` (plaintext) in O(1) JSONL format.
+4. **Circuit Breaker Twist**: Send 3 requests with `X-Simulate-Failure: true`, check `/health` (`"state": "OPEN"`), then send a 4th normal request showing instant `503` `"Service Busy"` in `<50ms` (no 2-second wait).
+5. **Automated & Stress Verification**: Run `docker-compose exec guardian-gateway pytest -v` and `docker-compose exec guardian-gateway python scripts/smoke_stress_test.py`.

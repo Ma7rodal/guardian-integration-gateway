@@ -1,10 +1,12 @@
-import json
+import base64
+import os
 import time
 from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.audit_log import AuditLogger
 from app.config import Settings
 from app.crypto import MessageEncryptor
 from app.main import create_app
@@ -17,10 +19,10 @@ def shared_sanitizer() -> PresidioSanitizer:
 
 
 @pytest.mark.asyncio
-async def test_secure_inquiry_happy_path_and_audit_log(
+async def test_secure_inquiry_happy_path_and_jsonl_audit_log(
     tmp_path: Path, shared_sanitizer: PresidioSanitizer
 ):
-    audit_file = tmp_path / "audit_log.json"
+    audit_file = tmp_path / "audit_log.jsonl"
     settings = Settings(
         audit_log_path=str(audit_file),
         mock_ai_delay_seconds=0.05,  # Fast delay for unit test suite
@@ -51,9 +53,12 @@ async def test_secure_inquiry_happy_path_and_audit_log(
     assert "<REDACTED: SSN>" in body["sanitizedMessage"]
     assert "bob@example.com" not in body["sanitizedMessage"]
 
-    # Verify audit log contains encrypted original + plaintext redacted
-    records = json.loads(audit_file.read_text(encoding="utf-8"))
+    # Verify O(1) JSONL audit log contains encrypted original + plaintext redacted
+    raw_lines = audit_file.read_text(encoding="utf-8").splitlines()
+    assert len(raw_lines) == 1
+    records = AuditLogger.read_records(audit_file)
     assert len(records) == 1
+
     entry = records[0]
     assert entry["userId"] == "user-101"
     assert entry["outcome"] == "SUCCESS"
@@ -69,7 +74,7 @@ async def test_secure_inquiry_happy_path_and_audit_log(
 async def test_circuit_breaker_instant_fallback_without_waiting(
     tmp_path: Path, shared_sanitizer: PresidioSanitizer
 ):
-    audit_file = tmp_path / "audit_log.json"
+    audit_file = tmp_path / "audit_log.jsonl"
     # Use a noticeable 0.5s simulated AI delay so we can prove the 4th call bypasses it
     settings = Settings(
         audit_log_path=str(audit_file),
@@ -112,8 +117,8 @@ async def test_circuit_breaker_instant_fallback_without_waiting(
     assert "<REDACTED: SSN>" in fb_body["sanitizedMessage"]
     assert elapsed < 0.15
 
-    # All 4 calls should be audited
-    records = json.loads(audit_file.read_text(encoding="utf-8"))
+    # All 4 calls should be audited as 4 JSONL lines
+    records = AuditLogger.read_records(audit_file)
     assert len(records) == 4
     assert [r["outcome"] for r in records] == [
         "AI_FAILURE",
@@ -121,3 +126,33 @@ async def test_circuit_breaker_instant_fallback_without_waiting(
         "AI_FAILURE",
         "CIRCUIT_OPEN",
     ]
+
+
+@pytest.mark.asyncio
+async def test_failure_simulation_header_ignored_in_production(
+    tmp_path: Path, shared_sanitizer: PresidioSanitizer
+):
+    audit_file = tmp_path / "audit_log.jsonl"
+    prod_key = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+    settings = Settings(
+        environment="production",
+        encryption_key=prod_key,
+        audit_log_path=str(audit_file),
+        mock_ai_delay_seconds=0.01,
+        cb_failure_threshold=3,
+    )
+    app = create_app(settings=settings, sanitizer=shared_sanitizer)
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Attacker attempts to trip the breaker 4 times via X-Simulate-Failure
+            for idx in range(4):
+                resp = await client.post(
+                    "/secure-inquiry",
+                    json={"userId": f"attacker-{idx}", "message": "Attempt DoS"},
+                    headers={"X-Simulate-Failure": "true"},
+                )
+                assert resp.status_code == 200
+                assert resp.json()["answer"] == "Generated Answer"
+                assert resp.json()["circuitState"] == "CLOSED"

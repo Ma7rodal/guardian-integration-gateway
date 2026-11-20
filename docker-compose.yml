@@ -7,9 +7,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Override ENCRYPTION_KEY in .env for non-demo environments
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ALLOW_FAILURE_SIMULATION: ${ALLOW_FAILURE_SIMULATION:-true}
+      # Override ENCRYPTION_KEY in .env for non-demo environments (enforced in production)
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
-      AUDIT_LOG_PATH: /app/data/audit_log.json
+      AUDIT_LOG_PATH: /app/data/audit_log.jsonl
       MOCK_AI_DELAY_SECONDS: ${MOCK_AI_DELAY_SECONDS:-2.0}
       CB_FAILURE_THRESHOLD: ${CB_FAILURE_THRESHOLD:-3}
       CB_RECOVERY_TIMEOUT_SECONDS: ${CB_RECOVERY_TIMEOUT_SECONDS:-30.0}

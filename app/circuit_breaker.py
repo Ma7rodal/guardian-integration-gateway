@@ -1,7 +1,7 @@
 import asyncio
 import time
 from enum import Enum
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Awaitable, Callable, Optional, Tuple, Type, TypeVar
 
 T = TypeVar("T")
 
@@ -25,24 +25,28 @@ class CircuitOpenError(Exception):
 class CircuitBreaker:
     """Async-safe 3-state Circuit Breaker (CLOSED -> OPEN -> HALF_OPEN).
 
-    Opens after `failure_threshold` consecutive failures and immediately rejects
-    subsequent calls until `recovery_timeout_seconds` elapses, then allows a
-    single probe request in HALF_OPEN state.
+    Opens after `failure_threshold` consecutive failures of `expected_exceptions`
+    and immediately rejects subsequent calls until `recovery_timeout_seconds`
+    elapses, then allows a single probe request in HALF_OPEN state.
     """
 
     def __init__(
         self,
         failure_threshold: int = 3,
         recovery_timeout_seconds: float = 30.0,
+        expected_exceptions: Tuple[Type[Exception], ...] = (Exception,),
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be >= 1")
         if recovery_timeout_seconds <= 0:
             raise ValueError("recovery_timeout_seconds must be > 0")
+        if not expected_exceptions:
+            raise ValueError("expected_exceptions must not be empty")
 
         self.failure_threshold = failure_threshold
         self.recovery_timeout_seconds = recovery_timeout_seconds
+        self.expected_exceptions = expected_exceptions
         self._clock = clock
 
         self._state = CircuitState.CLOSED
@@ -96,18 +100,36 @@ class CircuitBreaker:
 
         try:
             result = await func(*args, **kwargs)
-        except Exception:
+        except self.expected_exceptions:
             async with self._lock:
                 self._consecutive_failures += 1
-                if is_probe or self._consecutive_failures >= self.failure_threshold:
+                if is_probe:
+                    # Probe failed in HALF_OPEN -> re-open with fresh cooldown
                     self._state = CircuitState.OPEN
                     self._opened_at = self._clock()
-                self._half_open_probe_in_flight = False
+                    self._half_open_probe_in_flight = False
+                elif (
+                    self._state == CircuitState.CLOSED
+                    and self._consecutive_failures >= self.failure_threshold
+                ):
+                    # Only stamp _opened_at on the CLOSED -> OPEN transition;
+                    # concurrent late failures when already OPEN must not reset cooldown.
+                    self._state = CircuitState.OPEN
+                    self._opened_at = self._clock()
+            raise
+        except BaseException:
+            # Unexpected programming bugs / cancellations must not trip the breaker,
+            # but must release the HALF_OPEN probe slot if held.
+            if is_probe:
+                async with self._lock:
+                    self._half_open_probe_in_flight = False
             raise
         else:
             async with self._lock:
-                self._consecutive_failures = 0
-                self._state = CircuitState.CLOSED
-                self._opened_at = None
-                self._half_open_probe_in_flight = False
+                if is_probe or self._state == CircuitState.CLOSED:
+                    self._consecutive_failures = 0
+                    self._state = CircuitState.CLOSED
+                    self._opened_at = None
+                if is_probe:
+                    self._half_open_probe_in_flight = False
             return result

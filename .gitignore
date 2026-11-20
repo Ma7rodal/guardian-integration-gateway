@@ -6,5 +6,6 @@ venv/
 .pytest_cache/
 .env
 data/*.json
+data/*.jsonl
 !data/.gitkeep
 .DS_Store

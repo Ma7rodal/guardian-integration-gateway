@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -6,7 +7,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
-from app.ai_client import AIServiceError, MockAIClient
+from app.ai_client import AIClient, AIServiceError, MockAIClient
 from app.audit_log import AuditLogger
 from app.circuit_breaker import CircuitBreaker, CircuitOpenError
 from app.config import Settings, get_settings
@@ -29,22 +30,29 @@ logging.basicConfig(
 def create_app(
     settings: Optional[Settings] = None,
     sanitizer: Optional[PresidioSanitizer] = None,
+    ai_client: Optional[AIClient] = None,
 ) -> FastAPI:
     """Application factory for clean dependency injection and testability."""
     cfg = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logger.info("Initializing Guardian Integration Gateway...")
+        logger.info(
+            "Initializing Guardian Integration Gateway (env=%s)...",
+            cfg.environment,
+        )
         encryptor = MessageEncryptor(cfg.encryption_key)
         app.state.settings = cfg
         app.state.sanitizer = sanitizer or PresidioSanitizer(
             spacy_model_name=cfg.spacy_model_name
         )
-        app.state.ai_client = MockAIClient(delay_seconds=cfg.mock_ai_delay_seconds)
+        app.state.ai_client = ai_client or MockAIClient(
+            delay_seconds=cfg.mock_ai_delay_seconds
+        )
         app.state.circuit_breaker = CircuitBreaker(
             failure_threshold=cfg.cb_failure_threshold,
             recovery_timeout_seconds=cfg.cb_recovery_timeout_seconds,
+            expected_exceptions=(AIServiceError,),
         )
         app.state.audit_logger = AuditLogger(
             file_path=cfg.audit_log_path,
@@ -59,7 +67,7 @@ def create_app(
         version=cfg.app_version,
         description=(
             "Secure AI Middleware Gateway with Microsoft Presidio PII redaction, "
-            "AES-256-GCM encrypted audit logging, and a 3-state Circuit Breaker."
+            "AES-256-GCM encrypted O(1) JSONL audit logging, and a 3-state Circuit Breaker."
         ),
         lifespan=lifespan,
     )
@@ -94,24 +102,38 @@ def create_app(
         x_simulate_failure: bool = Header(
             default=False,
             alias="X-Simulate-Failure",
-            description="Set to 'true' to deterministically simulate an upstream AI failure.",
+            description=(
+                "Set to 'true' to deterministically simulate an upstream AI failure "
+                "(automatically disabled in production environments)."
+            ),
         ),
     ) -> JSONResponse:
         start = time.perf_counter()
 
-        # Step 1: Sanitize PII before touching any downstream AI service
-        sanitization = request.app.state.sanitizer.sanitize(payload.message)
+        # Guard failure simulation header so attackers cannot trigger DoS in production
+        if x_simulate_failure and not cfg.can_simulate_failures:
+            logger.warning(
+                "Ignored X-Simulate-Failure header in restricted environment (env=%s, userId=%s).",
+                cfg.environment,
+                payload.user_id,
+            )
+        effective_simulate_failure = x_simulate_failure and cfg.can_simulate_failures
+
+        # Step 1: Offload CPU-bound Presidio/spaCy NLP sanitization off the event loop
+        sanitization = await asyncio.to_thread(
+            request.app.state.sanitizer.sanitize, payload.message
+        )
 
         cb: CircuitBreaker = request.app.state.circuit_breaker
-        ai_client: MockAIClient = request.app.state.ai_client
+        provider: AIClient = request.app.state.ai_client
         audit_logger: AuditLogger = request.app.state.audit_logger
 
-        # Step 2: Protected Mock AI Call via Circuit Breaker
+        # Step 2: Protected AI Call via Circuit Breaker
         try:
             answer = await cb.call(
-                ai_client.generate_answer,
+                provider.generate_answer,
                 sanitization.sanitized_text,
-                simulate_failure=x_simulate_failure,
+                simulate_failure=effective_simulate_failure,
             )
             outcome = "SUCCESS"
             status_code = 200
@@ -132,12 +154,12 @@ def create_app(
             status_code = 502
             retry_after = cb.snapshot()["retry_after_seconds"]
             logger.error(
-                "Mock AI call failed for userId=%s (consecutive_failures=%d).",
+                "AI provider call failed for userId=%s (consecutive_failures=%d).",
                 payload.user_id,
                 cb.snapshot()["consecutive_failures"],
             )
 
-        # Step 3: Persist Audit Log (encrypted original + plaintext redacted)
+        # Step 3: Persist Audit Log in O(1) append-only JSONL
         await audit_logger.record(
             user_id=payload.user_id,
             original_message=payload.message,

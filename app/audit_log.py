@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,41 +10,38 @@ from app.crypto import MessageEncryptor
 
 
 class AuditLogger:
-    """Async-safe, atomic JSON audit store for encrypted original + redacted messages."""
+    """Async-safe O(1) append-only JSON Lines (.jsonl) audit store.
+
+    Stores each inquiry as one self-contained JSON line containing the
+    AES-256-GCM encrypted original message and plaintext redacted message,
+    avoiding O(n) full-file reads/rewrites under sustained traffic.
+    """
 
     def __init__(self, file_path: str, encryptor: MessageEncryptor) -> None:
         self.file_path = Path(file_path)
         self._encryptor = encryptor
         self._lock = asyncio.Lock()
 
-    def _read_records_sync(self) -> List[Dict[str, Any]]:
-        if not self.file_path.exists():
-            return []
-        content = self.file_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return []
-        data = json.loads(content)
-        if not isinstance(data, list):
-            return []
-        return data
-
-    def _write_records_atomic_sync(self, records: List[Dict[str, Any]]) -> None:
+    def _append_line_sync(self, entry: Dict[str, Any]) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.file_path.parent),
-            prefix=".audit_log_",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-                json.dump(records, tmp_file, indent=2, ensure_ascii=False)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
-            os.replace(tmp_path, self.file_path)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
+        serialized = json.dumps(entry, ensure_ascii=False) + "\n"
+        with self.file_path.open("a", encoding="utf-8") as audit_file:
+            audit_file.write(serialized)
+            audit_file.flush()
+            os.fsync(audit_file.fileno())
+
+    @staticmethod
+    def read_records(file_path: Path) -> List[Dict[str, Any]]:
+        """Parse all JSONL audit records from disk."""
+        if not file_path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        with file_path.open("r", encoding="utf-8") as audit_file:
+            for line in audit_file:
+                stripped = line.strip()
+                if stripped:
+                    records.append(json.loads(stripped))
+        return records
 
     async def record(
         self,
@@ -56,7 +52,7 @@ class AuditLogger:
         redacted_types: List[str],
         outcome: str,
     ) -> Dict[str, Any]:
-        """Encrypt the original message and atomically append an audit entry."""
+        """Encrypt the original message and append an O(1) JSONL audit entry."""
         entry: Dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -68,8 +64,6 @@ class AuditLogger:
         }
 
         async with self._lock:
-            records = await asyncio.to_thread(self._read_records_sync)
-            records.append(entry)
-            await asyncio.to_thread(self._write_records_atomic_sync, records)
+            await asyncio.to_thread(self._append_line_sync, entry)
 
         return entry

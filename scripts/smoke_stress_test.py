@@ -21,8 +21,9 @@ from typing import List, Tuple
 
 import httpx
 
-# Allow importing app.crypto when run directly from repo root or /app
+# Allow importing app modules when run directly from repo root or /app
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.audit_log import AuditLogger  # noqa: E402
 from app.crypto import MessageEncryptor  # noqa: E402
 
 
@@ -213,12 +214,12 @@ def stage_5_audit_integrity_check(
         return
 
     raw_text = path.read_text(encoding="utf-8")
-    records = json.loads(raw_text)
+    records = AuditLogger.read_records(path)
     assert isinstance(records, list) and len(records) > 0, "Audit log is empty or corrupt!"
 
-    # Zero-leak check: no raw secret should appear anywhere in plaintext JSON
+    # Zero-leak check: no raw secret should appear anywhere in plaintext JSONL
     for secret in injected_secrets:
-        assert secret not in raw_text, f"CRITICAL: Plaintext PII leak in audit_log.json: {secret}"
+        assert secret not in raw_text, f"CRITICAL: Plaintext PII leak in audit log: {secret}"
 
     # Decryption roundtrip check on every record
     key = os.environ.get(
@@ -230,7 +231,7 @@ def stage_5_audit_integrity_check(
         assert isinstance(decrypted, str) and len(decrypted) > 0, f"Record {idx} failed decrypt"
 
     print(
-        f"  PASS: {len(records)} valid JSON records verified, 0 plaintext PII leaks, "
+        f"  PASS: {len(records)} valid JSONL records verified, 0 plaintext PII leaks, "
         f"100% AES-256-GCM decryptable."
     )
 
@@ -276,7 +277,7 @@ async def ensure_circuit_closed(client: httpx.AsyncClient) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Guardian Gateway Smoke & Stress Suite")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--audit-log", default="/app/data/audit_log.json")
+    parser.add_argument("--audit-log", default="/app/data/audit_log.jsonl")
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--burst", type=int, default=50)
     args = parser.parse_args()

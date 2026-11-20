@@ -1,8 +1,18 @@
 import asyncio
+from typing import Protocol, runtime_checkable
 
 
 class AIServiceError(RuntimeError):
-    """Raised when the simulated external AI provider fails."""
+    """Raised when the external AI provider fails."""
+
+
+@runtime_checkable
+class AIClient(Protocol):
+    """Strategy interface for downstream AI providers."""
+
+    async def generate_answer(
+        self, sanitized_message: str, simulate_failure: bool = False
+    ) -> str: ...
 
 
 class MockAIClient:
