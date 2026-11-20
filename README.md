@@ -144,13 +144,3 @@ This project was built using a **Spec-Driven & Security-First** workflow with **
    - Guards `_opened_at` so late failures from concurrent in-flight calls cannot unfairly reset the cooldown timer once `OPEN`.
 6. **Hardened Containerization (`Dockerfile`)**:
    - Runs as a dedicated non-root user (`guardian`), includes a built-in `HEALTHCHECK`, and isolates secrets via `.env.example` / `.gitignore`.
-
----
-
-## 2–3 Minute Video Demo Checklist
-
-1. **Start Stack**: Run `docker-compose up --build -d` and `curl http://localhost:8000/health`.
-2. **Happy Path + PII Redaction**: Call `POST /secure-inquiry` (via Swagger UI at `http://localhost:8000/docs` or `curl`) with an email, credit card, and SSN; highlight the ~2s response, `<REDACTED: TYPE>` output, and `"Generated Answer"`.
-3. **Audit Log Verification**: Run `docker-compose exec guardian-gateway cat /app/data/audit_log.jsonl` to show `originalMessageEncrypted` (unreadable ciphertext) vs. `redactedMessage` (plaintext) in O(1) JSONL format.
-4. **Circuit Breaker Twist**: Send 3 requests with `X-Simulate-Failure: true`, check `/health` (`"state": "OPEN"`), then send a 4th normal request showing instant `503` `"Service Busy"` in `<50ms` (no 2-second wait).
-5. **Automated & Stress Verification**: Run `docker-compose exec guardian-gateway pytest -v` and `docker-compose exec guardian-gateway python scripts/smoke_stress_test.py`.
