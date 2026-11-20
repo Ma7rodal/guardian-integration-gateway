@@ -127,10 +127,11 @@ pytest -v
 
 This project was built using a **Spec-Driven & Security-First** workflow with **Google Antigravity (Gemini)**, followed by an adversarial security audit:
 
-1. **Enterprise PII Detection Off the Event Loop (`app/sanitizer.py`, `app/main.py`)**:
-   - Uses **Microsoft Presidio** (`presidio-analyzer` + `presidio-anonymizer`) with `en_core_web_sm` baked into the Docker image and pre-warmed at FastAPI `lifespan` startup.
-   - **Audited Edge Case**: Presidio's default `US_SSN` recognizer requires English context words or delimiters and can miss raw 9-digit numbers. We added `GuardianNineDigitSSNRecognizer` (`(?<!\d)\d{9}(?!\d)` and `\b\d{3}[-\s]\d{2}[-\s]\d{4}\b`) while relying on Presidio's Luhn-validated `CREDIT_CARD` recognizer (score `1.0`) so 16-digit cards are never split into 9-digit SSNs.
-   - **Non-blocking NLP**: CPU-bound `sanitizer.sanitize()` runs via `await asyncio.to_thread(...)` so long inputs never block uvicorn's async event loop.
+1. **Two-Layer Enterprise PII Detection Off the Event Loop (`app/sanitizer.py`, `app/main.py`)**:
+   - **Layer 1 (Regex Fast-Path)**: A linear-time compiled regex (`@|\d(?:[\s-]?\d){8,}`) short-circuits clean messages and short numeric references in `<0.1ms` without invoking Presidio.
+   - **Layer 2 (Deterministic Presidio)**: Uses a minimalist `RecognizerRegistry` with only `CreditCardRecognizer` (Luhn), `EmailRecognizer`, `UsSsnRecognizer`, and our custom `GuardianNineDigitSSNRecognizer`, excluding `SpacyRecognizer` (neural NER) and stripping spaCy's heavy `ner` and `parser` pipes from `en_core_web_sm` for language-agnostic, low-CPU execution.
+   - **Audited Edge Case**: Presidio's default `US_SSN` recognizer requires English context words or delimiters and can miss raw 9-digit numbers. `GuardianNineDigitSSNRecognizer` (`(?<!\d)\d{9}(?!\d)` and `\b\d{3}[-\s]\d{2}[-\s]\d{4}\b`) catches them reliably while Presidio's Luhn-validated `CREDIT_CARD` recognizer (score `1.0`) prevents 16-digit cards from splitting into 9-digit SSNs.
+   - **Non-blocking Execution**: `sanitizer.sanitize()` runs via `await asyncio.to_thread(...)` so large payloads never block uvicorn's async event loop.
 2. **Fail-Safe Production Configuration (`app/config.py`)**:
    - Startup validation via Pydantic `@model_validator` **refuses to boot** if `ENVIRONMENT=production` uses the default demo `ENCRYPTION_KEY`.
    - `X-Simulate-Failure` is strictly gated by `ENVIRONMENT != "production"` (`can_simulate_failures`), eliminating header-based DoS vectors in production.

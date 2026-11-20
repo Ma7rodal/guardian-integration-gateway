@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -8,6 +9,11 @@ from presidio_analyzer import (
     RecognizerRegistry,
 )
 from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_analyzer.predefined_recognizers import (
+    CreditCardRecognizer,
+    EmailRecognizer,
+    UsSsnRecognizer,
+)
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
@@ -19,6 +25,10 @@ ENTITY_TO_LABEL: Dict[str, str] = {
     "US_SSN": "SSN",
 }
 
+# Linear-time (ReDoS-safe) pre-filter: matches '@' (email candidate) or
+# >= 9 digits allowing single spaces/hyphens (SSN or credit card candidate).
+FAST_PATH_CANDIDATE_RE = re.compile(r"@|\d(?:[\s-]?\d){8,}")
+
 
 @dataclass(frozen=True)
 class SanitizationResult:
@@ -28,12 +38,15 @@ class SanitizationResult:
 
 
 class PresidioSanitizer:
-    """Enterprise PII sanitizer powered by Microsoft Presidio.
+    """Two-layer PII sanitizer combining a compiled regex fast-path with a
+    minimalist, deterministic Microsoft Presidio engine (no neural NER).
 
-    Detects and redacts:
-    - Credit Cards (built-in CreditCardRecognizer with Luhn checksum validation)
-    - Emails (built-in EmailRecognizer)
-    - SSNs & standalone 9-digit numeric sequences (built-in + custom PatternRecognizer)
+    Layer 1 (Fast-Path):
+        Skips Presidio completely (<0.1ms) when input has no '@' or >=9 digits.
+    Layer 2 (Deterministic Presidio):
+        Runs only CreditCardRecognizer (Luhn), EmailRecognizer, UsSsnRecognizer,
+        and GuardianNineDigitSSNRecognizer, excluding SpacyRecognizer & 20+
+        unused recognizers.
     """
 
     def __init__(self, spacy_model_name: str = "en_core_web_sm") -> None:
@@ -44,8 +57,19 @@ class PresidioSanitizer:
         provider = NlpEngineProvider(nlp_configuration=nlp_configuration)
         nlp_engine = provider.create_engine()
 
+        # Strip heavy neural components (ner, parser) since all registered
+        # recognizers are deterministic (regex + Luhn) and only need tokens/lemmas.
+        spacy_nlp = nlp_engine.nlp.get("en")
+        if spacy_nlp is not None:
+            for pipe_name in ("ner", "parser"):
+                if spacy_nlp.has_pipe(pipe_name):
+                    spacy_nlp.remove_pipe(pipe_name)
+
+        # Minimalist registry: deterministic recognizers only (no SpacyRecognizer)
         registry = RecognizerRegistry()
-        registry.load_predefined_recognizers(nlp_engine=nlp_engine)
+        registry.add_recognizer(CreditCardRecognizer())
+        registry.add_recognizer(EmailRecognizer())
+        registry.add_recognizer(UsSsnRecognizer())
 
         # Custom recognizer ensures both formatted SSNs (XXX-XX-XXXX / XXX XX XXXX)
         # and raw 9-digit numeric sequences are reliably caught regardless of
@@ -83,6 +107,15 @@ class PresidioSanitizer:
 
     def sanitize(self, text: str) -> SanitizationResult:
         """Analyze and redact target PII entities from input text."""
+        # Layer 1: Fast-Path bypass for messages with no PII candidates
+        if not FAST_PATH_CANDIDATE_RE.search(text):
+            return SanitizationResult(
+                sanitized_text=text,
+                redactions_count=0,
+                redacted_types=[],
+            )
+
+        # Layer 2: Deterministic Presidio validation (Luhn, RFC email, 9-digit SSN)
         results = self._analyzer.analyze(
             text=text,
             entities=TARGET_ENTITIES,

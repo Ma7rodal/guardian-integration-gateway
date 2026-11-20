@@ -73,3 +73,46 @@ def test_clean_message_unchanged(sanitizer: PresidioSanitizer):
     assert result.sanitized_text == text
     assert result.redactions_count == 0
     assert result.redacted_types == []
+
+
+def test_fast_path_bypasses_presidio_on_clean_and_short_number_messages(
+    sanitizer: PresidioSanitizer, monkeypatch: pytest.MonkeyPatch
+):
+    called = False
+
+    def _fail_if_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("Presidio AnalyzerEngine should be bypassed by Fast-Path!")
+
+    monkeypatch.setattr(sanitizer._analyzer, "analyze", _fail_if_called)
+
+    clean = sanitizer.sanitize("General inquiry without emails or long numbers.")
+    short_num = sanitizer.sanitize("Reference order #12345678 confirmed.")
+
+    assert called is False
+    assert clean.redactions_count == 0
+    assert short_num.sanitized_text == "Reference order #12345678 confirmed."
+
+
+def test_minimalist_registry_excludes_neural_spacy_recognizer(
+    sanitizer: PresidioSanitizer,
+):
+    recognizer_names = {
+        rec.name for rec in sanitizer._analyzer.registry.recognizers
+    }
+    assert "SpacyRecognizer" not in recognizer_names
+    assert recognizer_names == {
+        "CreditCardRecognizer",
+        "EmailRecognizer",
+        "UsSsnRecognizer",
+        "GuardianNineDigitSSNRecognizer",
+    }
+
+
+def test_spacy_pipeline_removes_heavy_ner_and_parser_pipes(
+    sanitizer: PresidioSanitizer,
+):
+    pipe_names = sanitizer._analyzer.nlp_engine.nlp["en"].pipe_names
+    assert "ner" not in pipe_names
+    assert "parser" not in pipe_names
