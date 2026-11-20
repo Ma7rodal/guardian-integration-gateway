@@ -20,7 +20,13 @@ class InquiryRequest(BaseModel):
         min_length=1,
         max_length=10000,
         description="Raw user message that may contain sensitive PII.",
-        examples=["My email is alice@example.com and my SSN is 123-45-6789."],
+        examples=[
+            "Hello! Please review my account jasson.rodriguez+vip@enterprise.io. "
+            "Valid cards: Visa 4532-0151-1283-0366 and MasterCard 5425233430109903. "
+            "Invalid Luhn tracking number (must NOT redact): 4532-0151-1283-0367. "
+            "IDs: SSN 123-45-6789 and 9-digit code 987654321. "
+            "Boundary IDs (must NOT redact): 8-digit order 12345678 and 10-digit phone 3001234567."
+        ],
     )
 
 
