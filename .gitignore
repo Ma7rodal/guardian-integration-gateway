@@ -8,4 +8,5 @@ venv/
 data/*.json
 data/*.jsonl
 !data/.gitkeep
+*.mov
 .DS_Store
